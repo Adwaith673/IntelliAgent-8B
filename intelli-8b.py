@@ -1,0 +1,1555 @@
+'''
+✓ LLM Intent Understanding - Asks what user wants if unclear
+✓ Conversation memory (full chat history preserved)
+✓ Stronger Math & Physics Agent with SymPy
+✓ Multi-source search (DuckDuckGo + SearXNG fallback)
+✓ Date extraction & freshness scoring
+✓ Better knowledge storage with timestamps
+✓ QWEN3:8B FALLBACK FOR MATH/PHYSICS
+✓ FIXED: DateTime offset-aware/naive comparison error
+✓ Smart Task Detection (Chat/Research/Coding/Math)
+✓ International + Indian News Sources
+✓ Date-aware responses (past/future detection)
+✓ Advanced Coding Workflow (Study → Design → Code → Verify → Google Search)
+✓ ENHANCED MATH/PHYSICS EXPLANATIONS - More Summary & Deep Reasoning
+✓ NEW: Smart Intent Understanding - Clarify unclear requests via web
+
+Requirements:
+pip install ollama requests beautifulsoup4 sympy python-dateutil'''
+
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from ollama import Client
+import json
+import os
+import time
+import re
+import requests
+import traceback
+
+try:
+    import sympy as sp
+    from sympy.parsing.sympy_parser import parse_expr
+except ImportError:
+    sp = None
+
+try:
+    from dateutil import parser as date_parser
+    DATEUTIL_AVAILABLE = True
+except ImportError:
+    DATEUTIL_AVAILABLE = False
+
+# ================== CONFIG ==================
+
+client = Client(host="http://localhost:11434")
+
+MODEL_NAME = "llama3.1:8b"
+QWEN_MODEL = "qwen3:8b"
+KNOWLEDGE_PATH = "knowledge_store.json"
+CONVERSATION_PATH = "conversation_history.json"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
+
+# NEWS SOURCES - International + Indian
+NEWS_SOURCES = {
+    "international": [
+        {"name": "BBC News", "url": "https://www.bbc.com/news"},
+        {"name": "Reuters", "url": "https://www.reuters.com"},
+        {"name": "AP News", "url": "https://apnews.com"},
+        {"name": "CNN", "url": "https://www.cnn.com"},
+        {"name": "The Guardian", "url": "https://www.theguardian.com"},
+    ],
+    "indian": [
+        {"name": "Times of India", "url": "https://timesofindia.indiatimes.com"},
+        {"name": "The Hindu", "url": "https://www.thehindu.com"},
+        {"name": "Indian Express", "url": "https://indianexpress.com"},
+        {"name": "Hindustan Times", "url": "https://www.hindustantimes.com"},
+        {"name": "NDTV", "url": "https://www.ndtv.com"},
+    ]
+}
+
+SYSTEM_PROMPT = """
+You are an advanced AI assistant with access to:
+- Real-time web knowledge (WEB_KNOWLEDGE)
+- Conversation history (you remember everything)
+- Symbolic math engine for perfect calculations
+- Date awareness (knows past/future)
+
+MODES:
+- Chat: Respond naturally, reference past conversation
+- Knowledge: Use WEB_KNOWLEDGE which contains verified multi-source data with dates
+- Math: Delegate to math engine for perfect accuracy
+- Code: Generate executable code in <python> or <cpp> tags
+- Research: Deep analysis with citations
+
+For code:
+<python>
+# code here
+</python>
+
+<cpp>
+// code here
+</cpp>
+
+CRITICAL RULES:
+- Always check dates when discussing current events
+- Reference conversation history naturally
+- Never hallucinate calculations - use the math engine
+- For conflicting info, state confidence level
+- For research: cite ALL sources and dates
+"""
+
+# ================== LLM INTENT UNDERSTANDING ==================
+
+def understand_user_intent(msg: str) -> Dict[str, Any]:
+    """LLM understands exactly what user wants - detailed intent parsing"""
+    
+    system_prompt = """You are an intent analyzer. Deeply understand what the user REALLY wants.
+
+Respond with ONLY JSON:
+{
+  "task_type": "MATH|CODING|RESEARCH|CHAT|UNCLEAR",
+  "confidence": 0.95,
+  "what_user_wants": "Brief 1-line summary of what user wants",
+  "specific_goal": "More specific goal/outcome the user expects",
+  "context": "Any important context or constraints",
+  "reasoning": "Why you classified it this way",
+  "clarification_needed": false,
+  "clarification_questions": []
+}
+
+RULES:
+- task_type: What is the ACTUAL task?
+- confidence: How sure are you? (0.0-1.0)
+- what_user_wants: What is user trying to achieve?
+- specific_goal: What is the desired outcome?
+- context: What important info do we need?
+- clarification_needed: Do we need to ask user for more info?
+- If confidence < 0.6, mark clarification_needed as true"""
+    
+    user_prompt = f"Deeply analyze what the user wants:\n\"{msg}\"\n\nRespond with JSON only:"
+    
+    try:
+        resp = client.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        raw = resp["message"]["content"].strip()
+        
+        try:
+            if raw.startswith("{"):
+                intent = json.loads(raw)
+            else:
+                match = re.search(r"\{.*\}", raw, re.DOTALL)
+                if match:
+                    intent = json.loads(match.group(0))
+                else:
+                    return {"task_type": "CHAT", "confidence": 0.0, "clarification_needed": True}
+        except json.JSONDecodeError:
+            return {"task_type": "CHAT", "confidence": 0.0, "clarification_needed": True}
+        
+        return intent
+        
+    except Exception as e:
+        print(f"[INTENT ERROR] {e}")
+        return {"task_type": "CHAT", "confidence": 0.0}
+
+def ask_web_about_intent(msg: str) -> Dict[str, Any]:
+    """Search web to understand what user is asking about"""
+    
+    print("[WEB_INTENT] Searching web to understand user intent...")
+    
+    # Search for context
+    results = multi_search(msg, max_results=3)
+    
+    if not results:
+        print("[WEB_INTENT] No web results found")
+        return {"task_type": "CHAT", "web_context": "No web context found"}
+    
+    # Extract content from top results
+    web_context_parts = []
+    for result in results[:2]:
+        url = result["url"]
+        text, _ = fetch_and_extract(url, max_chars=1000)
+        if text:
+            web_context_parts.append(f"Source: {result.get('source', 'Web')}\n{text[:500]}")
+    
+    web_context = "\n\n".join(web_context_parts)
+    
+    if not web_context:
+        print("[WEB_INTENT] Could not extract web content")
+        return {"task_type": "CHAT", "web_context": "No content extracted"}
+    
+    # Ask LLM with web context
+    clarify_prompt = f"""
+User message: "{msg}"
+
+Web context found:
+\"{web_context[:2000]}\"
+
+Based on web context, what does the user ACTUALLY want?
+What type of task is this?
+
+Respond with JSON:
+{{
+  "task_type": "MATH|CODING|RESEARCH|CHAT",
+  "what_user_wants": "What user wants",
+  "web_helped": true,
+  "explanation": "How web context helped clarify"
+}}
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are an intent analyzer. Use web context to understand user."},
+            {"role": "user", "content": clarify_prompt}
+        ]
+    )
+    
+    raw = resp["message"]["content"].strip()
+    
+    try:
+        if raw.startswith("{"):
+            result = json.loads(raw)
+        else:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                result = json.loads(match.group(0))
+            else:
+                result = {"task_type": "CHAT"}
+    except json.JSONDecodeError:
+        result = {"task_type": "CHAT"}
+    
+    result["web_context"] = web_context
+    return result
+
+def clarify_with_user(intent: Dict[str, Any]) -> Optional[str]:
+    """If LLM is unclear, ask user for clarification"""
+    
+    if not intent.get("clarification_needed", False):
+        return None
+    
+    questions = intent.get("clarification_questions", [])
+    
+    print("\n" + "="*80)
+    print("🤔 I need clarification to serve you better!")
+    print("="*80)
+    
+    if questions:
+        print("\nPlease answer these questions:\n")
+        for i, q in enumerate(questions, 1):
+            print(f"{i}. {q}")
+        print()
+    
+    clarification = input("You: ").strip()
+    
+    if clarification:
+        return clarification
+    
+    return None
+
+# ================== DETECT & UNDERSTAND TASK ==================
+
+def detect_and_understand_task(msg: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Pipeline:
+    1. LLM understands intent
+    2. If unclear, search web for context
+    3. Return task type + full intent info
+    """
+    
+    print("[PIPELINE] Understanding user intent...")
+    
+    # Step 1: LLM understands intent
+    intent = understand_user_intent(msg)
+    task_type = intent.get("task_type", "CHAT")
+    confidence = intent.get("confidence", 0.5)
+    
+    print(f"[PIPELINE] Initial understanding: {task_type} (confidence: {confidence:.0%})")
+    print(f"[PIPELINE] What user wants: {intent.get('what_user_wants', 'N/A')}")
+    
+    # Step 2: If unsure, use web to clarify
+    if task_type == "UNCLEAR" or confidence < 0.6:
+        print("[PIPELINE] Confidence too low - asking web for context...")
+        web_intent = ask_web_about_intent(msg)
+        
+        # Merge web findings with original intent
+        intent.update(web_intent)
+        task_type = web_intent.get("task_type", "CHAT")
+        
+        print(f"[PIPELINE] Web-assisted understanding: {task_type}")
+        print(f"[PIPELINE] What user wants: {web_intent.get('what_user_wants', 'N/A')}")
+    
+    return task_type, intent
+
+# ================== LLM-BASED TASK DETECTION (Original - Still Used) ==================
+
+def detect_task_type_with_llm(msg: str) -> str:
+    """Use LLM to intelligently detect task type"""
+    
+    system_prompt = """You are a task classifier. Classify user messages into ONE category.
+
+CATEGORIES:
+1. MATH - Mathematical problems, equations, physics, calculations (solve for x, integrate, etc)
+2. CODING - Build apps, websites, APIs, code projects, programming tasks
+3. RESEARCH - Explain concepts, current events, news, "what is", historical info, analysis
+4. CHAT - General conversation, greetings, opinions, casual questions
+
+RESPOND WITH ONLY:
+{
+  "task": "MATH|CODING|RESEARCH|CHAT",
+  "confidence": 0.95,
+  "reasoning": "Brief reason"
+}
+
+Be smart and contextual. If unsure (confidence < 0.7), return task as "UNCERTAIN"."""
+    
+    user_prompt = f"Classify this message:\n\"{msg}\""
+    
+    try:
+        resp = client.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        raw_response = resp["message"]["content"].strip()
+        
+        try:
+            if raw_response.startswith("{"):
+                result = json.loads(raw_response)
+            else:
+                match = re.search(r"\{.*\}", raw_response, re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                else:
+                    return "CHAT"
+        except json.JSONDecodeError:
+            return "CHAT"
+        
+        task = result.get("task", "CHAT").upper()
+        confidence = result.get("confidence", 0.5)
+        reasoning = result.get("reasoning", "")
+        
+        print(f"[DETECT] Task: {task} | Confidence: {confidence:.1%} | Reason: {reasoning}")
+        
+        if task == "UNCERTAIN" or confidence < 0.7:
+            print("[DETECT] Low confidence - asking web for verification...")
+            task = ask_web_for_task_classification(msg)
+            print(f"[DETECT] Web classified as: {task}")
+        
+        return task
+        
+    except Exception as e:
+        print(f"[DETECT ERROR] {e}")
+        return "CHAT"
+
+def ask_web_for_task_classification(msg: str) -> str:
+    """If LLM is uncertain, search web context to help classify"""
+    
+    print("[WEB_DETECT] Searching web for context...")
+    
+    results = multi_search(msg, max_results=3)
+    
+    if not results:
+        print("[WEB_DETECT] No web results - defaulting to CHAT")
+        return "CHAT"
+    
+    url = results[0]["url"]
+    text, _ = fetch_and_extract(url, max_chars=2000)
+    
+    if not text:
+        print("[WEB_DETECT] Could not extract web content - defaulting to CHAT")
+        return "CHAT"
+    
+    classify_prompt = f"""
+User message: "{msg}"
+
+Web context from search:
+\"{text[:1500]}\"
+
+Now classify - is this:
+1. MATH - Mathematical/physics problem?
+2. CODING - Programming/development task?
+3. RESEARCH - Knowledge/explanation question?
+4. CHAT - General conversation?
+
+Respond with ONLY the category: MATH|CODING|RESEARCH|CHAT
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a task classifier. Answer with ONLY one word."},
+            {"role": "user", "content": classify_prompt}
+        ]
+    )
+    
+    task = resp["message"]["content"].strip().upper()
+    
+    if task not in ("MATH", "CODING", "RESEARCH", "CHAT"):
+        task = "CHAT"
+    
+    return task
+
+# ================== CONVERSATION HISTORY ==================
+
+class ConversationManager:
+    def __init__(self, path: str = CONVERSATION_PATH):
+        self.path = path
+        self.messages: List[Dict[str, str]] = []
+        self.load()
+    
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.messages = data.get("messages", [])
+                    print(f"[CONV] Loaded {len(self.messages)} messages from history")
+            except Exception as e:
+                print(f"[CONV ERROR] Could not load: {e}")
+                self.messages = []
+    
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "messages": self.messages,
+                    "last_updated": datetime.now().isoformat()
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[CONV SAVE ERROR] {e}")
+    
+    def add(self, role: str, content: str):
+        self.messages.append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        })
+        self.save()
+    
+    def get_context(self, max_messages: int = 20) -> List[Dict[str, str]]:
+        """Get recent conversation for context"""
+        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        return [{"role": m["role"], "content": m["content"]} for m in recent]
+    
+    def clear(self):
+        self.messages = []
+        self.save()
+        print("[CONV] History cleared")
+
+conversation = ConversationManager()
+
+# ================== ENHANCED MEMORY ==================
+
+def _load_knowledge() -> Dict[str, Any]:
+    if not os.path.exists(KNOWLEDGE_PATH):
+        return {}
+    try:
+        with open(KNOWLEDGE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_knowledge(store: Dict[str, Any]) -> None:
+    try:
+        with open(KNOWLEDGE_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[MEMORY SAVE ERROR] {e}")
+
+def _normalize_query(q: str) -> str:
+    q = q.strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    return q[:200]
+
+def get_stored_knowledge(query: str) -> Optional[Dict[str, Any]]:
+    mem = _load_knowledge()
+    key = _normalize_query(query)
+    
+    if key in mem:
+        entry = mem[key]
+        stored_time = entry.get("time", 0)
+        age_hours = (time.time() - stored_time) / 3600
+        
+        if age_hours > 24:
+            print("[MEMORY] Cached news too old, refreshing...")
+            return None
+        
+        return entry
+    
+    for stored_key, entry in mem.items():
+        if key in stored_key or stored_key in key:
+            return entry
+    
+    return None
+
+def store_knowledge(query: str, summary: str, sources: List[str] = None, dates: List[str] = None) -> None:
+    if not summary:
+        return
+    
+    mem = _load_knowledge()
+    key = _normalize_query(query)
+    
+    mem[key] = {
+        "time": time.time(),
+        "date": datetime.now().isoformat(),
+        "summary": summary,
+        "sources": sources or [],
+        "dates": dates or [],
+    }
+    _save_knowledge(mem)
+    print(f"[MEMORY] Stored knowledge from {len(sources or [])} sources")
+
+# ================== DATE UTILITIES ==================
+
+def parse_date_safely(date_str: str) -> Optional[datetime]:
+    """Parse date string to datetime (offset-naive for comparison)"""
+    if not date_str or not DATEUTIL_AVAILABLE:
+        return None
+    
+    try:
+        dt = date_parser.parse(date_str, fuzzy=True)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except:
+        return None
+
+def get_date_context(dt: Optional[datetime]) -> str:
+    """Get human-readable date context"""
+    if not dt:
+        return ""
+    
+    now = datetime.now()
+    diff = (now - dt).days
+    
+    if diff < 0:
+        return f"(FUTURE: in {abs(diff)} days)"
+    elif diff == 0:
+        return "(TODAY)"
+    elif diff == 1:
+        return "(YESTERDAY)"
+    elif diff < 7:
+        return f"({diff} days ago)"
+    elif diff < 30:
+        return f"({diff//7} weeks ago)"
+    else:
+        return f"({dt.strftime('%B %Y')})"
+
+def is_past_event(date_str: str) -> bool:
+    """Check if date is in the past"""
+    dt = parse_date_safely(date_str)
+    if not dt:
+        return True
+    return (datetime.now() - dt).days > 0
+
+def is_future_event(date_str: str) -> bool:
+    """Check if date is in the future"""
+    dt = parse_date_safely(date_str)
+    if not dt:
+        return False
+    return (datetime.now() - dt).days < 0
+
+# ================== MULTI-SOURCE SEARCH ==================
+
+def search_ddg_html(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    """Enhanced DuckDuckGo search"""
+    try:
+        params = {"q": query, "kl": "us-en"}
+        r = requests.get("https://duckduckgo.com/html/", params=params, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        results = []
+        for result_div in soup.find_all("div", class_="result"):
+            try:
+                title_elem = result_div.find("a", class_="result__a")
+                if not title_elem:
+                    continue
+                title = title_elem.get_text(strip=True)
+                url = title_elem.get("href", "")
+                
+                if url.startswith("/l/?kh=") or url.startswith("//duckduckgo.com"):
+                    if "uddg=" in url:
+                        from urllib.parse import parse_qs, urlparse, unquote
+                        try:
+                            qs = parse_qs(urlparse(url).query)
+                            url = unquote(qs.get("uddg", [""])[0])
+                        except:
+                            continue
+                    else:
+                        continue
+                
+                if url.startswith("http") and "duckduckgo.com" not in url:
+                    results.append({"url": url, "title": title, "source": "ddg"})
+                
+                if len(results) >= max_results:
+                    break
+            except Exception as e:
+                continue
+        
+        return results
+    except Exception as e:
+        print(f"[SEARCH/DDG ERROR] {e}")
+        return []
+
+def search_searxng(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    """Fallback: Public SearXNG instance"""
+    try:
+        instances = [
+            "https://searx.be",
+            "https://search.sapti.me",
+            "https://searx.tiekoetter.com"
+        ]
+        
+        for instance in instances:
+            try:
+                params = {
+                    "q": query,
+                    "format": "json",
+                    "categories": "general"
+                }
+                r = requests.get(f"{instance}/search", params=params, headers=HEADERS, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                
+                results = []
+                for item in data.get("results", [])[:max_results]:
+                    results.append({
+                        "url": item.get("url", ""),
+                        "title": item.get("title", ""),
+                        "source": "searxng"
+                    })
+                
+                if results:
+                    return results
+            except:
+                continue
+        
+        return []
+    except Exception as e:
+        print(f"[SEARCH/SEARXNG ERROR] {e}")
+        return []
+
+def search_news_sources(query: str, source_type: str = "all") -> List[Dict[str, str]]:
+    """Search international and Indian news sources"""
+    results = []
+    
+    if source_type in ("all", "international"):
+        for news in NEWS_SOURCES["international"]:
+            try:
+                r = requests.get(news["url"], headers=HEADERS, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                
+                for article in soup.find_all(["h1", "h2", "h3"], limit=5):
+                    text = article.get_text(strip=True)
+                    if query.lower() in text.lower() and len(text) > 10:
+                        results.append({
+                            "url": news["url"],
+                            "title": text,
+                            "source": news["name"]
+                        })
+            except:
+                continue
+    
+    if source_type in ("all", "indian"):
+        for news in NEWS_SOURCES["indian"]:
+            try:
+                r = requests.get(news["url"], headers=HEADERS, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                
+                for article in soup.find_all(["h1", "h2", "h3"], limit=5):
+                    text = article.get_text(strip=True)
+                    if query.lower() in text.lower() and len(text) > 10:
+                        results.append({
+                            "url": news["url"],
+                            "title": text,
+                            "source": news["name"]
+                        })
+            except:
+                continue
+    
+    return results[:10]
+
+def multi_search(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    """Search multiple sources and merge"""
+    all_results = []
+    
+    print("[SEARCH] Trying news sources...")
+    news = search_news_sources(query, "all")
+    all_results.extend(news)
+    
+    print("[SEARCH] Searching DuckDuckGo...")
+    ddg = search_ddg_html(query, max_results)
+    all_results.extend(ddg)
+    
+    if len(all_results) < 3:
+        print("[SEARCH] Results low, trying SearXNG...")
+        searx = search_searxng(query, max_results)
+        all_results.extend(searx)
+    
+    seen = set()
+    unique = []
+    for item in all_results:
+        url = item["url"]
+        if url not in seen and url.startswith("http"):
+            seen.add(url)
+            unique.append(item)
+    
+    return unique[:max_results]
+
+# ================== DATE EXTRACTION ==================
+
+def extract_date_from_html(html: str, url: str) -> Optional[str]:
+    """Extract publication date from HTML"""
+    soup = BeautifulSoup(html, "html.parser")
+    
+    date_metas = [
+        ('meta', {'property': 'article:published_time'}),
+        ('meta', {'name': 'publish-date'}),
+        ('meta', {'name': 'date'}),
+        ('meta', {'property': 'og:updated_time'}),
+        ('meta', {'name': 'DC.date.issued'}),
+    ]
+    
+    for tag, attrs in date_metas:
+        elem = soup.find(tag, attrs)
+        if elem:
+            date_str = elem.get('content') or elem.get('datetime', '')
+            if date_str:
+                return date_str
+    
+    time_tags = soup.find_all("time")
+    for time_tag in time_tags:
+        dt = time_tag.get("datetime") or time_tag.get_text(strip=True)
+        if dt:
+            return dt
+    
+    if DATEUTIL_AVAILABLE:
+        text = soup.get_text()[:5000]
+        date_patterns = [
+            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}',
+            r'\d{4}-\d{2}-\d{2}',
+            r'\d{1,2}/\d{1,2}/\d{4}'
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(0)
+    
+    return None
+
+# ================== ENHANCED FETCHING ==================
+
+def fetch_and_extract(url: str, max_chars: int = 10000) -> Tuple[str, Optional[str]]:
+    """Fetch page and extract text + date"""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12, allow_redirects=True)
+        r.raise_for_status()
+        
+        content_type = r.headers.get("Content-Type", "")
+        if "text/html" not in content_type:
+            return "", None
+        
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
+        
+        date = extract_date_from_html(html, url)
+        
+        for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
+            tag.decompose()
+        
+        main_content = soup.find("main") or soup.find("article") or soup.find("body")
+        
+        if main_content:
+            texts = []
+            for elem in main_content.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
+                text = elem.get_text(separator=" ", strip=True)
+                if len(text) > 20:
+                    texts.append(text)
+            
+            joined = "\n".join(texts)[:max_chars]
+            return joined, date
+        
+        return "", None
+        
+    except Exception as e:
+        print(f"[FETCH ERROR] {url[:50]}: {e}")
+        return "", None
+
+def deep_browse_multi(query: str, max_pages: int = 10) -> Tuple[str, List[str], List[str]]:
+    """Enhanced browsing with date tracking"""
+    print(f"[BROWSE] Searching multiple sources for: {query[:50]}...")
+    
+    results = multi_search(query, max_results=max_pages)
+    
+    if not results:
+        print("[BROWSE] No search results found")
+        return "", [], []
+    
+    print(f"[BROWSE] Found {len(results)} results, fetching content...")
+    
+    parts = []
+    sources = []
+    dates = []
+    
+    for i, item in enumerate(results):
+        url = item["url"]
+        print(f"[BROWSE] [{i+1}/{len(results)}] {url[:60]}...")
+        
+        text, date = fetch_and_extract(url)
+        
+        if text:
+            date_str = ""
+            if date:
+                parsed = parse_date_safely(date)
+                if parsed:
+                    date_str = f" [{parsed.strftime('%Y-%m-%d')}]"
+                    dates.append(date)
+            
+            parts.append(f"=== SOURCE {i+1}{date_str} ===\nURL: {url}\nSource: {item.get('source', 'Web')}\n\n{text}\n")
+            sources.append(url)
+    
+    if not parts:
+        print("[BROWSE] No content extracted")
+        return "", [], []
+    
+    combined = "\n\n".join(parts)
+    print(f"[BROWSE] Successfully extracted {len(sources)} sources")
+    
+    return combined, sources, dates
+
+# ================== ENHANCED SUMMARIZATION ==================
+
+def summarize_with_dates(query: str, raw_text: str, sources: List[str], dates: List[str]) -> str:
+    """Summarize with emphasis on dates and accuracy"""
+    if not raw_text:
+        return ""
+    
+    freshness_note = ""
+    if dates:
+        parsed_dates = [parse_date_safely(d) for d in dates]
+        parsed_dates = [d for d in parsed_dates if d is not None]
+        
+        if parsed_dates:
+            newest = max(parsed_dates)
+            oldest = min(parsed_dates)
+            
+            days_ago = (datetime.now() - newest).days
+            if days_ago == 0:
+                freshness_note = "🔴 Sources from TODAY (VERY FRESH)\n\n"
+            elif days_ago == 1:
+                freshness_note = "🟡 Sources from YESTERDAY\n\n"
+            elif days_ago < 7:
+                freshness_note = f"🟡 Sources from {days_ago} days ago\n\n"
+            elif days_ago < 30:
+                freshness_note = f"🟢 Sources from {days_ago // 7} weeks ago\n\n"
+            else:
+                freshness_note = f"🟢 Sources from {newest.strftime('%B %Y')}\n\n"
+    
+    prompt = f"""
+User query:
+{query}
+
+{freshness_note}
+
+Raw content from {len(sources)} verified sources:
+\"\"\"{raw_text[:25000]}\"\"\"
+
+CRITICAL INSTRUCTIONS:
+1. ALWAYS include specific dates when mentioned in sources
+2. If sources have conflicting info, mention BOTH with dates
+3. For current events, emphasize timeline (what happened when)
+4. Structure: Overview → Key Facts with Dates → Current Status → Context
+5. Rate confidence: [HIGH/MEDIUM/LOW CONFIDENCE] at the end
+6. Keep numerical facts EXACT (don't round unless necessary)
+7. This will be stored as reference - make it comprehensive and accurate
+8. Cite sources with numbers like [1], [2], etc.
+
+Create a detailed, date-aware summary:
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a meticulous research analyst. Accuracy and dates are critical."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    summary = resp["message"]["content"].strip()
+    
+    if sources:
+        summary += f"\n\n📚 **SOURCES ({len(sources)} verified articles):**\n"
+        for i, src in enumerate(sources[:10], 1):
+            summary += f"[{i}] {src}\n"
+    
+    return summary
+
+# ================== ENHANCED MATH & PHYSICS SUPER AGENT ==================
+
+def generate_math_explanation_summary(problem: str, solution: str) -> str:
+    """Generate comprehensive explanation and summary for math solution"""
+    
+    print("[MATH] Generating comprehensive explanation...")
+    
+    explanation_prompt = f"""
+PROBLEM: {problem}
+
+SOLUTION PROVIDED:
+{solution}
+
+Generate a COMPREHENSIVE explanation with:
+
+1. **PROBLEM SUMMARY**
+   - What exactly are we solving?
+   - What is being asked?
+   - Key information given
+
+2. **SOLUTION APPROACH**
+   - What method/formula did we use?
+   - Why is this the right approach?
+   - Alternative approaches (if any)
+
+3. **DETAILED STEPS**
+   - Break down EVERY step
+   - Explain the mathematical reasoning for each step
+   - Show any substitutions or transformations
+   - Explain why certain rules/theorems apply
+
+4. **FINAL ANSWER**
+   - Clear statement of the answer
+   - Verify if it makes sense (sanity check)
+   - Units/dimensions (if applicable)
+
+5. **KEY CONCEPTS INVOLVED**
+   - List all mathematical concepts used
+   - Brief explanation of each concept
+   - Real-world applications (if applicable)
+
+6. **TIPS FOR SIMILAR PROBLEMS**
+   - Common mistakes to avoid
+   - How to approach similar questions
+   - Practice methods
+
+7. **CONFIDENCE ASSESSMENT**
+   - Is this answer 100% accurate? [YES/NO]
+   - Verification check done? [YES/NO]
+   - Why is this answer reliable?
+
+IMPORTANT:
+- Be VERY detailed and comprehensive
+- Assume reader has basic math knowledge but needs clarification
+- Use proper mathematical notation
+- Include numerical verification where possible
+- Make it educational and helpful for learning
+
+Provide complete explanation:
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": """You are an expert mathematics and physics tutor. 
+Your job is to provide COMPREHENSIVE explanations that help students truly understand, not just see the answer.
+Be thorough, clear, and educational."""
+            },
+            {"role": "user", "content": explanation_prompt}
+        ]
+    )
+    
+    return resp["message"]["content"].strip()
+
+def physics_reasoning_summary(problem: str, solution: str) -> str:
+    """Special reasoning for physics problems"""
+    
+    print("[PHYSICS] Generating physics reasoning and summary...")
+    
+    physics_prompt = f"""
+PHYSICS PROBLEM: {problem}
+
+SOLUTION:
+{solution}
+
+Provide COMPREHENSIVE physics analysis:
+
+1. **PHYSICAL CONCEPT**
+   - What physics principle governs this problem?
+   - What laws/theorems apply? (Newton's laws, Energy conservation, etc.)
+   - Why do these laws apply here?
+
+2. **PROBLEM BREAKDOWN**
+   - Identify all forces/fields/interactions
+   - What is changing and what is constant?
+   - What are we trying to find and why?
+
+3. **SOLUTION METHODOLOGY**
+   - Step-by-step solution with physical interpretation
+   - What does each equation represent physically?
+   - Why did we choose this path to solution?
+
+4. **PHYSICAL INTERPRETATION**
+   - What does the answer mean in real world?
+   - Is the magnitude reasonable?
+   - Is the direction/sign correct?
+   - What happens if we change variables?
+
+5. **VERIFICATION**
+   - Does it satisfy physical laws?
+   - Dimensional analysis - correct units?
+   - Limiting case check - does it make sense at extremes?
+   - Order of magnitude - is it reasonable?
+
+6. **DEEPER UNDERSTANDING**
+   - Why is this result true?
+   - Connection to other concepts
+   - Real-world applications and examples
+
+7. **COMMON MISCONCEPTIONS**
+   - What mistakes do students make?
+   - How to think about this correctly
+   - Why intuition might be wrong here
+
+Format answer for deep understanding, not just calculation.
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": """You are a physics expert and educator with deep understanding.
+Explain physics problems with emphasis on:
+- Physical intuition and reasoning
+- Real-world meaning
+- Why concepts work the way they do
+- Prevention of common misconceptions"""
+            },
+            {"role": "user", "content": physics_prompt}
+        ]
+    )
+    
+    return resp["message"]["content"].strip()
+
+def math_physics_super_agent(user_msg: str) -> Optional[str]:
+    """Enhanced math/physics agent with detailed explanations"""
+    
+    print("\n[MATH_AGENT] Processing mathematical/physics problem...")
+    
+    is_physics = any(word in user_msg.lower() for word in ["force", "velocity", "acceleration", "gravity", "energy", "momentum", "physics", "newton"])
+    
+    system = """You are an expert math and physics tutor.
+Provide COMPLETE solutions with:
+- Full derivation and ALL steps
+- Mathematical reasoning for each step
+- Proper mathematical notation
+- Verification of answer"""
+    
+    try:
+        resp = client.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg}
+            ]
+        )
+        initial_solution = resp["message"]["content"].strip()
+        
+        if len(initial_solution) > 50:
+            print("[MATH_AGENT] ✓ Initial solution found!")
+            print("[MATH_AGENT] Generating comprehensive explanation...")
+            
+            if is_physics:
+                detailed_explanation = physics_reasoning_summary(user_msg, initial_solution)
+            else:
+                detailed_explanation = generate_math_explanation_summary(user_msg, initial_solution)
+            
+            final_output = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧮 MATHEMATICAL SOLUTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{initial_solution}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 COMPREHENSIVE EXPLANATION & REASONING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{detailed_explanation}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ Solved using llama3.1:8b with comprehensive explanation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+            
+            return final_output
+            
+    except Exception as e:
+        print(f"[MATH ERROR] {e}")
+    
+    print("[MATH_AGENT] Fallback to Qwen3:8b...")
+    try:
+        qwen_resp = client.chat(
+            model=QWEN_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Solve with complete derivation, detailed explanation, and reasoning. Provide comprehensive answer."
+                },
+                {"role": "user", "content": user_msg}
+            ]
+        )
+        qwen_solution = qwen_resp["message"]["content"].strip()
+        
+        if len(qwen_solution) > 50:
+            print("[MATH_AGENT] ✓ Qwen3:8b found solution!")
+            
+            if is_physics:
+                detailed_explanation = physics_reasoning_summary(user_msg, qwen_solution)
+            else:
+                detailed_explanation = generate_math_explanation_summary(user_msg, qwen_solution)
+            
+            final_output = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧮 MATHEMATICAL SOLUTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{qwen_solution}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 COMPREHENSIVE EXPLANATION & REASONING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{detailed_explanation}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ Solved using Qwen3:8b specialized math engine with comprehensive explanation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+            
+            return final_output
+            
+    except Exception as e:
+        print(f"[QWEN_ERROR] {e}")
+    
+    return None
+
+# ================== ADVANCED CODING WORKFLOW ==================
+
+def study_coding_project(requirement: str) -> str:
+    """Step 1: Study the project requirements"""
+    print("\n[CODING_AGENT] STEP 1: STUDYING PROJECT...")
+    
+    study_prompt = f"""
+Study this product requirement:
+\"{requirement}\"
+
+Research and provide:
+1. **What exists**: Similar existing solutions
+2. **Best approach**: How professionals build this
+3. **Tech stack**: Industry standard technologies
+4. **Architecture**: High-level system design
+5. **Key challenges**: Hard parts to solve
+6. **Time estimate**: Realistic timeline
+
+Be detailed.
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a senior software architect with 15+ years experience."},
+            {"role": "user", "content": study_prompt}
+        ]
+    )
+    
+    return resp["message"]["content"].strip()
+
+def design_better_product(requirement: str, study: str) -> str:
+    """Step 2: Design a BETTER solution"""
+    print("[CODING_AGENT] STEP 2: DESIGNING BETTER PRODUCT...")
+    
+    design_prompt = f"""
+REQUIREMENT: {requirement}
+
+RESEARCH:
+{study}
+
+Design a BETTER, more robust solution:
+1. **Unique features**: What makes it better?
+2. **Best practices**: Industry standards
+3. **Scalability**: Handle growth
+4. **Security**: Security considerations
+5. **Performance**: Optimization strategies
+6. **Database design**: Data structure
+7. **Error handling**: Robust error management
+8. **Testing strategy**: How to test
+
+Provide detailed technical design.
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a senior software architect."},
+            {"role": "user", "content": design_prompt}
+        ]
+    )
+    
+    return resp["message"]["content"].strip()
+
+def generate_full_code(requirement: str, design: str) -> str:
+    """Step 3: Generate full production-ready code"""
+    print("[CODING_AGENT] STEP 3: GENERATING FULL CODE...")
+    
+    code_prompt = f"""
+Build COMPLETE, production-ready code:
+
+REQUIREMENT: {requirement}
+
+DESIGN:
+{design}
+
+Generate FULL, working code with:
+- Complete implementation
+- Error handling and logging
+- Comments explaining logic
+- Best practices throughout
+- Ready to run immediately
+
+Use Python.
+
+<python>
+# FULL WORKING CODE HERE
+</python>
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a senior developer. Write complete, production-ready code."},
+            {"role": "user", "content": code_prompt}
+        ]
+    )
+    
+    return resp["message"]["content"].strip()
+
+def verify_solution(requirement: str, code: str) -> str:
+    """Step 4: Verify the solution"""
+    print("[CODING_AGENT] STEP 4: VERIFYING SOLUTION...")
+    
+    verify_prompt = f"""
+Verify this code solution:
+
+REQUIREMENT: {requirement}
+
+CODE:
+{code}
+
+Analyze:
+1. **Does it meet requirement?**
+2. **Code quality**: Good practices?
+3. **Performance**: Efficient?
+4. **Security issues**: Any vulnerabilities?
+5. **Error handling**: Proper?
+6. **Bug report**: Any bugs?
+7. **Improvements**: What to fix?
+8. **Confidence**: [HIGH/MEDIUM/LOW]
+
+Detailed verification report:
+"""
+    
+    resp = client.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a code reviewer and QA expert."},
+            {"role": "user", "content": verify_prompt}
+        ]
+    )
+    
+    return resp["message"]["content"].strip()
+
+def search_google_verify(requirement: str, code_summary: str) -> str:
+    """Step 5: Search Google to verify solution"""
+    print("[CODING_AGENT] STEP 5: GOOGLE VERIFICATION...")
+    
+    search_query = f"{requirement} github best practices tutorial"
+    print(f"[CODING_AGENT] Searching: {search_query}")
+    
+    raw_text, sources, dates = deep_browse_multi(search_query, max_pages=5)
+    
+    if raw_text:
+        verify_prompt = f"""
+Our solution for: {requirement}
+
+Our approach: {code_summary}
+
+Top solutions from web:
+{raw_text[:10000]}
+
+ANALYZE:
+1. Similar to top solutions? YES/NO
+2. Missing key features?
+3. Better technologies available?
+4. What to learn from top implementations?
+5. Final verdict: [EXCELLENT/GOOD/NEEDS_WORK]
+
+Be honest and critical.
+"""
+        
+        resp = client.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a code quality analyst."},
+                {"role": "user", "content": verify_prompt}
+            ]
+        )
+        
+        analysis = resp["message"]["content"].strip()
+        
+        if sources:
+            analysis += f"\n\n📚 **REFERENCES:**\n"
+            for i, src in enumerate(sources[:5], 1):
+                analysis += f"[{i}] {src}\n"
+        
+        return analysis
+    
+    return "[GOOGLE_VERIFY] No web results found"
+
+def coding_workflow(requirement: str) -> str:
+    """Complete advanced coding workflow"""
+    output = "🔧 **ADVANCED CODING WORKFLOW STARTED**\n"
+    output += "=" * 80 + "\n\n"
+    
+    study = study_coding_project(requirement)
+    output += "📚 **STEP 1: STUDYING PROJECT**\n"
+    output += "-" * 80 + "\n" + study + "\n\n"
+    
+    design = design_better_product(requirement, study)
+    output += "🏗️ **STEP 2: DESIGNING BETTER SOLUTION**\n"
+    output += "-" * 80 + "\n" + design + "\n\n"
+    
+    code = generate_full_code(requirement, design)
+    output += "💻 **STEP 3: GENERATING FULL CODE**\n"
+    output += "-" * 80 + "\n" + code + "\n\n"
+    
+    verification = verify_solution(requirement, code)
+    output += "✅ **STEP 4: VERIFICATION**\n"
+    output += "-" * 80 + "\n" + verification + "\n\n"
+    
+    code_summary = code[:500] if len(code) > 500 else code
+    google_verify = search_google_verify(requirement, code_summary)
+    output += "🔍 **STEP 5: GOOGLE VERIFICATION**\n"
+    output += "-" * 80 + "\n" + google_verify + "\n\n"
+    
+    output += "=" * 80 + "\n"
+    output += "✨ **CODING WORKFLOW COMPLETE**\n"
+    
+    return output
+
+# ================== MAIN CHAT WITH NEW INTENT PIPELINE ==================
+
+def chat(user_msg: str) -> str:
+    """
+    NEW PIPELINE:
+    1. Understand user intent deeply with LLM
+    2. If unclear, search web for context
+    3. Route to appropriate handler (MATH/CODING/RESEARCH/CHAT)
+    4. Execute handler based on confirmed task type
+    """
+    
+    print("[PIPELINE] ========== NEW INTENT UNDERSTANDING PIPELINE ==========")
+    
+    # Step 1: Understand intent with LLM
+    task_type, intent_info = detect_and_understand_task(user_msg)
+    
+    print(f"\n[PIPELINE] Task Type: {task_type}")
+    print(f"[PIPELINE] User Goal: {intent_info.get('what_user_wants', 'N/A')}")
+    print(f"[PIPELINE] Specific Goal: {intent_info.get('specific_goal', 'N/A')}")
+    
+    # Step 2: Route to appropriate handler
+    print(f"\n[PIPELINE] Routing to {task_type} handler...")
+    
+    # MATH MODE
+    if task_type == "MATH":
+        print("[PIPELINE] → MATH HANDLER")
+        if sp is not None:
+            try:
+                math_ans = math_physics_super_agent(user_msg)
+                if math_ans is not None:
+                    conversation.add("user", user_msg)
+                    conversation.add("assistant", math_ans)
+                    return math_ans
+            except Exception as e:
+                print(f"[MATH ERROR] {e}")
+    
+    # CODING MODE
+    if task_type == "CODING":
+        print("[PIPELINE] → CODING HANDLER")
+        try:
+            result = coding_workflow(user_msg)
+            conversation.add("user", user_msg)
+            conversation.add("assistant", result)
+            return result
+        except Exception as e:
+            print(f"[CODING ERROR] {e}")
+            return f"[ERROR] Coding workflow failed: {e}"
+    
+    # RESEARCH MODE
+    if task_type == "RESEARCH":
+        print("[PIPELINE] → RESEARCH HANDLER")
+        stored = get_stored_knowledge(user_msg)
+        
+        if stored:
+            print("[MEMORY] Using cached knowledge")
+            web_summary = stored.get("summary", "")
+        else:
+            print("[RESEARCH] Starting deep web research...")
+            raw_text, sources, dates = deep_browse_multi(user_msg, max_pages=10)
+            
+            if raw_text:
+                print("[SUMMARIZE] Processing multi-source content...")
+                web_summary = summarize_with_dates(user_msg, raw_text, sources, dates)
+                store_knowledge(user_msg, web_summary, sources, dates)
+            else:
+                web_summary = "[RESEARCH] No online sources found"
+        
+        conversation.add("user", user_msg)
+        conversation.add("assistant", web_summary)
+        return web_summary
+    
+    # NORMAL CHAT MODE
+    print("[PIPELINE] → CHAT HANDLER")
+    
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    context = conversation.get_context(max_messages=15)
+    messages.extend(context)
+    messages.append({"role": "user", "content": user_msg})
+    
+    try:
+        resp = client.chat(model=MODEL_NAME, messages=messages)
+        reply = resp["message"]["content"]
+    except Exception as e:
+        print(f"[LLM ERROR] {e}")
+        return f"[ERROR] {e}"
+    
+    conversation.add("user", user_msg)
+    conversation.add("assistant", reply)
+    
+    return reply
+
+# ================== REPL ==================
+
+def print_banner():
+    print("\n" + "="*80)
+    print("🚀 SYSAI ENHANCED - Ultimate Local AI Assistant")
+    print("="*80)
+    print(f"Model: {MODEL_NAME}")
+    print(f"Math Fallback: {QWEN_MODEL}")
+    print(f"Features: Smart Chat | Research | Coding Workflow | Enhanced Math/Physics | Multi-Search")
+    print(f"Task Detection: LLM-Intelligent Intent Understanding (with Web Fallback)")
+    print(f"Pipeline: Intent → Web Research (if unsure) → Route to Handler")
+    print(f"Date Library: {'✓ Active' if DATEUTIL_AVAILABLE else '✗ Disabled'}")
+    print(f"Math Engine: {'✓ Active' if sp else '✗ Disabled (install sympy)'}")
+    print(f"Conversation: {len(conversation.messages)} messages loaded")
+    print("="*80)
+    print("\nCOMMANDS:")
+    print("  'exit' or 'quit' - Exit")
+    print("  'clear' - Clear conversation history")
+    print("  'history' - Show conversation stats")
+    print("  'memory' - Show stored knowledge")
+    print("="*80 + "\n")
+
+def show_stats():
+    """Show conversation and memory stats"""
+    mem = _load_knowledge()
+    
+    print("\n" + "="*80)
+    print("📊 SYSTEM STATISTICS")
+    print("="*80)
+    print(f"Conversation messages: {len(conversation.messages)}")
+    print(f"Knowledge entries: {len(mem)}")
+    print("="*80 + "\n")
+
+def show_memory():
+    """Show stored knowledge"""
+    mem = _load_knowledge()
+    
+    if not mem:
+        print("\n[No stored knowledge yet]\n")
+        return
+    
+    print("\n" + "="*80)
+    print("🧠 STORED KNOWLEDGE")
+    print("="*80)
+    
+    for i, (key, entry) in enumerate(mem.items(), 1):
+        age_hours = (time.time() - entry.get("time", 0)) / 3600
+        age_str = f"{age_hours:.1f}h ago" if age_hours < 24 else f"{age_hours/24:.1f}d ago"
+        sources_count = len(entry.get("sources", []))
+        
+        print(f"\n{i}. {key[:70]}")
+        print(f"   Age: {age_str} | Sources: {sources_count}")
+    
+    print("="*80 + "\n")
+
+def main():
+    """Main REPL loop"""
+    print_banner()
+    
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n👋 Goodbye!\n")
+            break
+        
+        if not user_input:
+            continue
+        
+        cmd = user_input.lower()
+        
+        if cmd in ("exit", "quit", "bye"):
+            print("\n👋 Goodbye!\n")
+            break
+        
+        if cmd == "clear":
+            conversation.clear()
+            print("\n✓ Conversation history cleared\n")
+            continue
+        
+        if cmd == "history":
+            show_stats()
+            continue
+        
+        if cmd == "memory":
+            show_memory()
+            continue
+        
+        # Process message
+        try:
+            print()
+            response = chat(user_input)
+            print(f"\nAssistant: {response}\n")
+        except Exception as e:
+            print(f"\n[CRITICAL ERROR] {e}")
+            traceback.print_exc()
+            print()
+
+if __name__ == "__main__":
+    main()
