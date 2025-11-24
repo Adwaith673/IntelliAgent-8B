@@ -13,6 +13,10 @@
 ✓ Advanced Coding Workflow (Study → Design → Code → Verify → Google Search)
 ✓ ENHANCED MATH/PHYSICS EXPLANATIONS - More Summary & Deep Reasoning
 ✓ NEW: Smart Intent Understanding - Clarify unclear requests via web
+✓ NEW: FAST PATH for simple queries (greetings, basic math, time/weather)
+✓ NEW: DEDICATED CODER MODEL (qwen2.5-coder:7b) for code generation
+✓ NEW: OUTPUT VERIFICATION PIPELINE - Validates answers against Google
+✓ NEW: NATURAL CHAT RESPONSES - No scripted replies
 
 Requirements:
 pip install ollama requests beautifulsoup4 sympy python-dateutil'''
@@ -46,6 +50,7 @@ client = Client(host="http://localhost:11434")
 
 MODEL_NAME = "llama3.1:8b"
 QWEN_MODEL = "qwen3:8b"
+CODER_MODEL = "qwen2.5-coder:7b"  # NEW: Dedicated coding model
 KNOWLEDGE_PATH = "knowledge_store.json"
 CONVERSATION_PATH = "conversation_history.json"
 
@@ -100,7 +105,296 @@ CRITICAL RULES:
 - Never hallucinate calculations - use the math engine
 - For conflicting info, state confidence level
 - For research: cite ALL sources and dates
+- In casual chat, respond naturally without scripted phrases
 """
+
+# ================== NEW: FAST PATH DETECTION ==================
+
+def fast_path_check(msg: str) -> Optional[Tuple[str, str]]:
+    """
+    Fast path for simple queries that don't need heavy pipeline.
+    Returns: (task_type, answer) if handled, None otherwise
+    """
+    msg_lower = msg.lower().strip()
+    
+    # 1. GREETINGS & CASUAL CHAT
+    greeting_patterns = [
+        r'\b(hi|hey|hello|sup|wassup|yo)\b',
+        r'\bhow are you\b',
+        r'\bwhat\'?s up\b',
+        r'\bgood (morning|afternoon|evening|night)\b',
+        r'\bnice to meet you\b',
+    ]
+    
+    for pattern in greeting_patterns:
+        if re.search(pattern, msg_lower):
+            print("[FAST_PATH] ✓ Detected: GREETING")
+            return ("CHAT_FAST", None)  # Let LLM respond naturally
+    
+    # 2. SIMPLE ARITHMETIC (not algorithm complexity!)
+    # Only trigger if it's clearly a direct calculation
+    simple_math_patterns = [
+        r'^[\d\s\+\-\*/\(\)\.]+$',  # Pure arithmetic: "2+2", "10*5"
+        r'^(what is|what\'s|calculate|compute)\s+[\d\s\+\-\*/\(\)\.]+\??$',  # "what is 2+2"
+    ]
+    
+    # EXCLUDE if it contains algorithm/complexity keywords
+    exclude_keywords = ['complexity', 'algorithm', 'big o', 'runtime', 'performance', 'analysis']
+    if not any(keyword in msg_lower for keyword in exclude_keywords):
+        for pattern in simple_math_patterns:
+            if re.search(pattern, msg_lower):
+                print("[FAST_PATH] ✓ Detected: SIMPLE ARITHMETIC")
+                try:
+                    # Extract and evaluate
+                    equation = re.sub(r'(what is|what\'s|calculate|compute)', '', msg_lower)
+                    equation = equation.strip().strip('?')
+                    result = eval(equation)
+                    return ("MATH_FAST", f"**Answer:** {result}")
+                except:
+                    pass
+    
+    # 3. TIME QUERIES (but not "time complexity"!)
+    time_patterns = [
+        r'\b(what is|what\'s|current|show|tell me).*\btime\b.*\b(in|at|for)\b',  # "what's the time in Tokyo"
+        r'\btime\s+(in|at|for)\s+\w+',  # "time in London"
+        r'\bcurrent time\b',
+        r'\bwhat time is it\b',
+    ]
+    
+    # EXCLUDE algorithm/complexity context
+    if 'complexity' not in msg_lower and 'algorithm' not in msg_lower:
+        for pattern in time_patterns:
+            if re.search(pattern, msg_lower):
+                print("[FAST_PATH] ✓ Detected: TIME QUERY")
+                # Extract location if present
+                location_match = re.search(r'\b(in|at|for)\s+(\w+(?:\s+\w+)?)', msg_lower)
+                location = location_match.group(2) if location_match else "local"
+                
+                current_time = datetime.now().strftime("%H:%M:%S")
+                current_date = datetime.now().strftime("%A, %B %d, %Y")
+                
+                answer = f"**Current Time:** {current_time}\n**Date:** {current_date}\n**Location:** {location.title()}"
+                
+                if location != "local":
+                    answer += f"\n\n*Note: For accurate {location.title()} time, please check a timezone converter.*"
+                
+                return ("TIME_FAST", answer)
+    
+    # 4. WEATHER QUERIES
+    weather_patterns = [
+        r'\b(weather|temperature|forecast|climate)\b.*\b(in|at|for|of)\s+\w+',
+        r'\b(what\'s|what is|how\'s|how is).*\b(weather|temperature)\b',
+        r'\b(rain|sunny|cloudy|storm)\b.*\b(today|tomorrow)\b',
+    ]
+    
+    for pattern in weather_patterns:
+        if re.search(pattern, msg_lower):
+            print("[FAST_PATH] ✓ Detected: WEATHER QUERY (needs web search)")
+            return ("WEATHER_FAST", None)  # Will use quick web search
+    
+    # 5. SIMPLE "WHO/WHAT/WHERE IS" questions that need quick search
+    quick_search_patterns = [
+        r'^(who|what|where) (is|are|was|were)\s+\w+',  # "who is X", "what is Y"
+    ]
+    
+    for pattern in quick_search_patterns:
+        if re.search(pattern, msg_lower) and len(msg.split()) <= 6:  # Keep it simple
+            print("[FAST_PATH] ✓ Detected: QUICK SEARCH QUERY")
+            return ("QUICK_SEARCH", None)
+    
+    # No fast path match
+    return None
+
+# ================== NEW: OUTPUT VERIFICATION PIPELINE ==================
+
+def verify_output_with_google(question: str, generated_output: str, task_type: str) -> Dict[str, Any]:
+    """
+    Verify generated output by searching Google and comparing.
+    Returns verification result with confidence score.
+    """
+    print("\n" + "="*80)
+    print("🔍 GOOGLE VERIFICATION PIPELINE STARTED")
+    print("="*80)
+    
+    # Don't verify casual chat
+    if task_type in ("CHAT", "CHAT_FAST", "GREETING"):
+        return {
+            "verified": True,
+            "confidence": 1.0,
+            "message": "Casual chat - no verification needed",
+            "corrections": None
+        }
+    
+    print(f"[VERIFY] Task Type: {task_type}")
+    print(f"[VERIFY] Question: {question[:100]}...")
+    
+    # Step 1: Search Google for the same question
+    print("[VERIFY] Searching web for verification...")
+    search_query = question
+    raw_text, sources, dates = deep_browse_multi(search_query, max_pages=5)
+    
+    if not raw_text:
+        print("[VERIFY] ⚠️ No web sources found for verification")
+        return {
+            "verified": False,
+            "confidence": 0.5,
+            "message": "Could not find web sources for verification",
+            "corrections": None
+        }
+    
+    # Step 2: Compare our output with web sources
+    print("[VERIFY] Comparing output with web sources...")
+    
+    comparison_prompt = f"""
+You are a fact-checker. Compare our AI's answer with verified web sources.
+
+QUESTION:
+{question}
+
+OUR AI'S ANSWER:
+{generated_output[:3000]}
+
+WEB SOURCES (VERIFIED):
+{raw_text[:5000]}
+
+CRITICAL ANALYSIS:
+1. Is our answer FACTUALLY CORRECT? [YES/NO/PARTIALLY]
+2. Confidence in our answer? [0.0 - 1.0]
+3. What did we get RIGHT?
+4. What did we get WRONG (if anything)?
+5. Should we correct anything? [YES/NO]
+6. If YES, what corrections are needed?
+7. Overall verdict: [PASS/FAIL/NEEDS_IMPROVEMENT]
+
+Respond with JSON only:
+{{
+  "factually_correct": "YES|NO|PARTIALLY",
+  "confidence": 0.95,
+  "correct_parts": ["list of correct things"],
+  "incorrect_parts": ["list of errors"],
+  "needs_correction": false,
+  "corrections": "specific corrections needed",
+  "verdict": "PASS|FAIL|NEEDS_IMPROVEMENT",
+  "reasoning": "detailed explanation"
+}}
+"""
+    
+    try:
+        resp = client.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a meticulous fact-checker. Be honest and critical."},
+                {"role": "user", "content": comparison_prompt}
+            ]
+        )
+        
+        raw = resp["message"]["content"].strip()
+        
+        # Parse JSON
+        try:
+            if raw.startswith("{"):
+                result = json.loads(raw)
+            else:
+                match = re.search(r"\{.*\}", raw, re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                else:
+                    result = {"verified": False, "confidence": 0.5}
+        except json.JSONDecodeError:
+            result = {"verified": False, "confidence": 0.5}
+        
+        # Add sources
+        result["sources"] = sources[:5]
+        
+        print(f"[VERIFY] ✓ Verdict: {result.get('verdict', 'UNKNOWN')}")
+        print(f"[VERIFY] ✓ Confidence: {result.get('confidence', 0):.0%}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"[VERIFY ERROR] {e}")
+        return {
+            "verified": False,
+            "confidence": 0.5,
+            "message": f"Verification failed: {e}",
+            "corrections": None
+        }
+
+def handle_verification_result(verification: Dict[str, Any], original_output: str, question: str) -> str:
+    """
+    Handle verification result and optionally fix output.
+    """
+    verdict = verification.get("verdict", "UNKNOWN")
+    confidence = verification.get("confidence", 0.5)
+    needs_correction = verification.get("needs_correction", False)
+    
+    if verdict == "PASS" and confidence >= 0.8:
+        print("[VERIFY] ✅ Output verified - PASSING as is")
+        
+        verification_badge = f"\n\n{'='*80}\n✅ **VERIFIED** - Cross-checked with {len(verification.get('sources', []))} web sources (Confidence: {confidence:.0%})\n{'='*80}"
+        return original_output + verification_badge
+    
+    elif verdict == "FAIL" or needs_correction:
+        print("[VERIFY] ❌ Output failed verification - ATTEMPTING FIX")
+        
+        # Search web again for correct answer
+        print("[VERIFY] Researching correct answer from web...")
+        raw_text, sources, dates = deep_browse_multi(question, max_pages=8)
+        
+        if raw_text:
+            fix_prompt = f"""
+The previous answer was INCORRECT or INCOMPLETE.
+
+QUESTION:
+{question}
+
+PREVIOUS (INCORRECT) ANSWER:
+{original_output[:2000]}
+
+WHAT WAS WRONG:
+{verification.get('incorrect_parts', 'Multiple errors')}
+
+CORRECTIONS NEEDED:
+{verification.get('corrections', 'See web sources')}
+
+VERIFIED WEB SOURCES:
+{raw_text[:8000]}
+
+Generate a NEW, CORRECT, COMPREHENSIVE answer based on verified web sources.
+Be accurate and detailed. Include sources.
+"""
+            
+            resp = client.chat(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are a research expert. Provide accurate, well-sourced answers."},
+                    {"role": "user", "content": fix_prompt}
+                ]
+            )
+            
+            corrected_output = resp["message"]["content"].strip()
+            
+            # Add correction notice
+            correction_notice = f"\n\n{'='*80}\n⚠️ **CORRECTED ANSWER** - Original answer was inaccurate\n{'='*80}\n\n"
+            
+            if sources:
+                corrected_output += f"\n\n📚 **VERIFIED SOURCES ({len(sources)}):**\n"
+                for i, src in enumerate(sources[:5], 1):
+                    corrected_output += f"[{i}] {src}\n"
+            
+            print("[VERIFY] ✅ Generated corrected answer")
+            return correction_notice + corrected_output
+        
+        else:
+            warning = f"\n\n{'='*80}\n⚠️ **VERIFICATION FAILED** - Could not verify answer accuracy\nConfidence: {confidence:.0%}\n{'='*80}"
+            return original_output + warning
+    
+    else:
+        # Partial pass
+        print(f"[VERIFY] ⚠️ Output partially verified (Confidence: {confidence:.0%})")
+        
+        warning = f"\n\n{'='*80}\n⚠️ **PARTIALLY VERIFIED** - Some details may need verification\nConfidence: {confidence:.0%}\n{'='*80}"
+        return original_output + warning
 
 # ================== LLM INTENT UNDERSTANDING ==================
 
@@ -1149,10 +1443,10 @@ Provide COMPLETE solutions with:
     
     return None
 
-# ================== ADVANCED CODING WORKFLOW ==================
+# ================== NEW: ADVANCED CODING WORKFLOW WITH DEDICATED CODER MODEL ==================
 
 def study_coding_project(requirement: str) -> str:
-    """Step 1: Study the project requirements"""
+    """Step 1: Study the project requirements (Manager: llama3.1)"""
     print("\n[CODING_AGENT] STEP 1: STUDYING PROJECT...")
     
     study_prompt = f"""
@@ -1171,7 +1465,7 @@ Be detailed.
 """
     
     resp = client.chat(
-        model=MODEL_NAME,
+        model=MODEL_NAME,  # Manager model
         messages=[
             {"role": "system", "content": "You are a senior software architect with 15+ years experience."},
             {"role": "user", "content": study_prompt}
@@ -1181,7 +1475,7 @@ Be detailed.
     return resp["message"]["content"].strip()
 
 def design_better_product(requirement: str, study: str) -> str:
-    """Step 2: Design a BETTER solution"""
+    """Step 2: Design a BETTER solution (Manager: llama3.1)"""
     print("[CODING_AGENT] STEP 2: DESIGNING BETTER PRODUCT...")
     
     design_prompt = f"""
@@ -1204,7 +1498,7 @@ Provide detailed technical design.
 """
     
     resp = client.chat(
-        model=MODEL_NAME,
+        model=MODEL_NAME,  # Manager model
         messages=[
             {"role": "system", "content": "You are a senior software architect."},
             {"role": "user", "content": design_prompt}
@@ -1214,8 +1508,8 @@ Provide detailed technical design.
     return resp["message"]["content"].strip()
 
 def generate_full_code(requirement: str, design: str) -> str:
-    """Step 3: Generate full production-ready code"""
-    print("[CODING_AGENT] STEP 3: GENERATING FULL CODE...")
+    """Step 3: Generate full production-ready code (Specialist: qwen2.5-coder)"""
+    print("[CODING_AGENT] STEP 3: GENERATING FULL CODE WITH SPECIALIST CODER MODEL...")
     
     code_prompt = f"""
 Build COMPLETE, production-ready code:
@@ -1239,18 +1533,35 @@ Use Python.
 </python>
 """
     
-    resp = client.chat(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "You are a senior developer. Write complete, production-ready code."},
-            {"role": "user", "content": code_prompt}
-        ]
-    )
-    
-    return resp["message"]["content"].strip()
+    try:
+        # Use dedicated coder model for code generation
+        resp = client.chat(
+            model=CODER_MODEL,  # Specialist coder model
+            messages=[
+                {"role": "system", "content": "You are an expert software engineer. Write complete, production-ready, well-documented code."},
+                {"role": "user", "content": code_prompt}
+            ]
+        )
+        
+        print("[CODING_AGENT] ✓ Code generated by specialist coder model (qwen2.5-coder:7b)")
+        return resp["message"]["content"].strip()
+        
+    except Exception as e:
+        print(f"[CODER ERROR] Specialist model failed: {e}")
+        print("[CODING_AGENT] Falling back to manager model...")
+        
+        # Fallback to manager model
+        resp = client.chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a senior developer. Write complete, production-ready code."},
+                {"role": "user", "content": code_prompt}
+            ]
+        )
+        return resp["message"]["content"].strip()
 
 def verify_solution(requirement: str, code: str) -> str:
-    """Step 4: Verify the solution"""
+    """Step 4: Verify the solution (Manager: llama3.1)"""
     print("[CODING_AGENT] STEP 4: VERIFYING SOLUTION...")
     
     verify_prompt = f"""
@@ -1275,7 +1586,7 @@ Detailed verification report:
 """
     
     resp = client.chat(
-        model=MODEL_NAME,
+        model=MODEL_NAME,  # Manager model
         messages=[
             {"role": "system", "content": "You are a code reviewer and QA expert."},
             {"role": "user", "content": verify_prompt}
@@ -1284,8 +1595,46 @@ Detailed verification report:
     
     return resp["message"]["content"].strip()
 
+def fix_code_with_specialist(requirement: str, code: str, issues: str) -> str:
+    """NEW: Fix code issues using specialist coder model"""
+    print("[CODING_AGENT] FIXING CODE WITH SPECIALIST MODEL...")
+    
+    fix_prompt = f"""
+Fix the issues in this code:
+
+REQUIREMENT: {requirement}
+
+CURRENT CODE:
+{code}
+
+ISSUES FOUND:
+{issues}
+
+Generate FIXED, production-ready code that addresses ALL issues.
+
+<python>
+# FIXED CODE HERE
+</python>
+"""
+    
+    try:
+        resp = client.chat(
+            model=CODER_MODEL,  # Specialist coder model
+            messages=[
+                {"role": "system", "content": "You are an expert debugger and code fixer. Fix all issues thoroughly."},
+                {"role": "user", "content": fix_prompt}
+            ]
+        )
+        
+        print("[CODING_AGENT] ✓ Code fixed by specialist model")
+        return resp["message"]["content"].strip()
+        
+    except Exception as e:
+        print(f"[CODER ERROR] Fix failed: {e}")
+        return code  # Return original if fix fails
+
 def search_google_verify(requirement: str, code_summary: str) -> str:
-    """Step 5: Search Google to verify solution"""
+    """Step 5: Search Google to verify solution (Manager: llama3.1)"""
     print("[CODING_AGENT] STEP 5: GOOGLE VERIFICATION...")
     
     search_query = f"{requirement} github best practices tutorial"
@@ -1313,7 +1662,7 @@ Be honest and critical.
 """
         
         resp = client.chat(
-            model=MODEL_NAME,
+            model=MODEL_NAME,  # Manager model
             messages=[
                 {"role": "system", "content": "You are a code quality analyst."},
                 {"role": "user", "content": verify_prompt}
@@ -1332,48 +1681,123 @@ Be honest and critical.
     return "[GOOGLE_VERIFY] No web results found"
 
 def coding_workflow(requirement: str) -> str:
-    """Complete advanced coding workflow"""
+    """Complete advanced coding workflow with specialist coder model"""
     output = "🔧 **ADVANCED CODING WORKFLOW STARTED**\n"
     output += "=" * 80 + "\n\n"
     
+    # Manager: Study
     study = study_coding_project(requirement)
-    output += "📚 **STEP 1: STUDYING PROJECT**\n"
+    output += "📚 **STEP 1: STUDYING PROJECT** (Manager: llama3.1)\n"
     output += "-" * 80 + "\n" + study + "\n\n"
     
+    # Manager: Design
     design = design_better_product(requirement, study)
-    output += "🏗️ **STEP 2: DESIGNING BETTER SOLUTION**\n"
+    output += "🏗️ **STEP 2: DESIGNING BETTER SOLUTION** (Manager: llama3.1)\n"
     output += "-" * 80 + "\n" + design + "\n\n"
     
+    # Specialist: Generate Code
     code = generate_full_code(requirement, design)
-    output += "💻 **STEP 3: GENERATING FULL CODE**\n"
+    output += "💻 **STEP 3: GENERATING FULL CODE** (Specialist: qwen2.5-coder:7b)\n"
     output += "-" * 80 + "\n" + code + "\n\n"
     
+    # Manager: Verify
     verification = verify_solution(requirement, code)
-    output += "✅ **STEP 4: VERIFICATION**\n"
+    output += "✅ **STEP 4: VERIFICATION** (Manager: llama3.1)\n"
     output += "-" * 80 + "\n" + verification + "\n\n"
     
+    # Check if fixes needed
+    if "bug" in verification.lower() or "issue" in verification.lower() or "fix" in verification.lower():
+        print("[CODING_AGENT] Issues detected - applying fixes...")
+        fixed_code = fix_code_with_specialist(requirement, code, verification)
+        output += "🔧 **STEP 4.5: CODE FIXES APPLIED** (Specialist: qwen2.5-coder:7b)\n"
+        output += "-" * 80 + "\n" + fixed_code + "\n\n"
+        code = fixed_code  # Update code
+    
+    # Manager: Google Verify
     code_summary = code[:500] if len(code) > 500 else code
     google_verify = search_google_verify(requirement, code_summary)
-    output += "🔍 **STEP 5: GOOGLE VERIFICATION**\n"
+    output += "🔍 **STEP 5: GOOGLE VERIFICATION** (Manager: llama3.1)\n"
     output += "-" * 80 + "\n" + google_verify + "\n\n"
     
     output += "=" * 80 + "\n"
     output += "✨ **CODING WORKFLOW COMPLETE**\n"
+    output += "**Models Used:** Manager (llama3.1:8b) + Specialist (qwen2.5-coder:7b)\n"
     
     return output
 
-# ================== MAIN CHAT WITH NEW INTENT PIPELINE ==================
+# ================== MAIN CHAT WITH NEW PIPELINES ==================
 
 def chat(user_msg: str) -> str:
     """
-    NEW PIPELINE:
+    NEW ENHANCED PIPELINE:
+    0. Fast path check for simple queries (greetings, basic math, time/weather)
     1. Understand user intent deeply with LLM
     2. If unclear, search web for context
     3. Route to appropriate handler (MATH/CODING/RESEARCH/CHAT)
     4. Execute handler based on confirmed task type
+    5. Verify output with Google (for RESEARCH/CODING/MATH)
+    6. Return final verified answer
     """
     
-    print("[PIPELINE] ========== NEW INTENT UNDERSTANDING PIPELINE ==========")
+    # ========== STEP 0: FAST PATH CHECK ==========
+    print("[PIPELINE] ========== CHECKING FAST PATH ==========")
+    fast_result = fast_path_check(user_msg)
+    
+    if fast_result:
+        task_type, answer = fast_result
+        
+        # Handle fast path results
+        if task_type == "CHAT_FAST":
+            # Natural conversational response
+            print("[PIPELINE] → FAST PATH: Natural Chat")
+            
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            context = conversation.get_context(max_messages=10)
+            messages.extend(context)
+            messages.append({"role": "user", "content": user_msg})
+            
+            try:
+                resp = client.chat(model=MODEL_NAME, messages=messages)
+                reply = resp["message"]["content"]
+            except Exception as e:
+                print(f"[LLM ERROR] {e}")
+                return f"[ERROR] {e}"
+            
+            conversation.add("user", user_msg)
+            conversation.add("assistant", reply)
+            return reply
+        
+        elif task_type in ("MATH_FAST", "TIME_FAST"):
+            # Direct answer already provided
+            print(f"[PIPELINE] → FAST PATH: {task_type}")
+            conversation.add("user", user_msg)
+            conversation.add("assistant", answer)
+            return answer
+        
+        elif task_type == "WEATHER_FAST":
+            # Quick weather search
+            print("[PIPELINE] → FAST PATH: Weather Query")
+            raw_text, sources, dates = deep_browse_multi(user_msg, max_pages=3)
+            
+            if raw_text:
+                summary = summarize_with_dates(user_msg, raw_text, sources, dates)
+                conversation.add("user", user_msg)
+                conversation.add("assistant", summary)
+                return summary
+        
+        elif task_type == "QUICK_SEARCH":
+            # Quick factual search
+            print("[PIPELINE] → FAST PATH: Quick Search")
+            raw_text, sources, dates = deep_browse_multi(user_msg, max_pages=3)
+            
+            if raw_text:
+                summary = summarize_with_dates(user_msg, raw_text, sources, dates)
+                conversation.add("user", user_msg)
+                conversation.add("assistant", summary)
+                return summary
+    
+    # ========== STEP 1-2: FULL INTENT UNDERSTANDING ==========
+    print("\n[PIPELINE] ========== FULL INTENT UNDERSTANDING PIPELINE ==========")
     
     # Step 1: Understand intent with LLM
     task_type, intent_info = detect_and_understand_task(user_msg)
@@ -1382,8 +1806,10 @@ def chat(user_msg: str) -> str:
     print(f"[PIPELINE] User Goal: {intent_info.get('what_user_wants', 'N/A')}")
     print(f"[PIPELINE] Specific Goal: {intent_info.get('specific_goal', 'N/A')}")
     
-    # Step 2: Route to appropriate handler
+    # ========== STEP 3: ROUTE TO HANDLER ==========
     print(f"\n[PIPELINE] Routing to {task_type} handler...")
+    
+    output = None
     
     # MATH MODE
     if task_type == "MATH":
@@ -1392,9 +1818,7 @@ def chat(user_msg: str) -> str:
             try:
                 math_ans = math_physics_super_agent(user_msg)
                 if math_ans is not None:
-                    conversation.add("user", user_msg)
-                    conversation.add("assistant", math_ans)
-                    return math_ans
+                    output = math_ans
             except Exception as e:
                 print(f"[MATH ERROR] {e}")
     
@@ -1403,9 +1827,7 @@ def chat(user_msg: str) -> str:
         print("[PIPELINE] → CODING HANDLER")
         try:
             result = coding_workflow(user_msg)
-            conversation.add("user", user_msg)
-            conversation.add("assistant", result)
-            return result
+            output = result
         except Exception as e:
             print(f"[CODING ERROR] {e}")
             return f"[ERROR] Coding workflow failed: {e}"
@@ -1429,41 +1851,63 @@ def chat(user_msg: str) -> str:
             else:
                 web_summary = "[RESEARCH] No online sources found"
         
-        conversation.add("user", user_msg)
-        conversation.add("assistant", web_summary)
-        return web_summary
+        output = web_summary
     
     # NORMAL CHAT MODE
-    print("[PIPELINE] → CHAT HANDLER")
+    if task_type == "CHAT" and output is None:
+        print("[PIPELINE] → CHAT HANDLER")
+        
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        context = conversation.get_context(max_messages=15)
+        messages.extend(context)
+        messages.append({"role": "user", "content": user_msg})
+        
+        try:
+            resp = client.chat(model=MODEL_NAME, messages=messages)
+            reply = resp["message"]["content"]
+        except Exception as e:
+            print(f"[LLM ERROR] {e}")
+            return f"[ERROR] {e}"
+        
+        conversation.add("user", user_msg)
+        conversation.add("assistant", reply)
+        return reply
     
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    context = conversation.get_context(max_messages=15)
-    messages.extend(context)
-    messages.append({"role": "user", "content": user_msg})
+    # ========== STEP 4: VERIFY OUTPUT WITH GOOGLE ==========
+    if output:
+        print("\n[PIPELINE] ========== VERIFICATION PHASE ==========")
+        
+        verification = verify_output_with_google(user_msg, output, task_type)
+        
+        # Handle verification result
+        final_output = handle_verification_result(verification, output, user_msg)
+        
+        conversation.add("user", user_msg)
+        conversation.add("assistant", final_output)
+        
+        return final_output
     
-    try:
-        resp = client.chat(model=MODEL_NAME, messages=messages)
-        reply = resp["message"]["content"]
-    except Exception as e:
-        print(f"[LLM ERROR] {e}")
-        return f"[ERROR] {e}"
-    
+    # Fallback
     conversation.add("user", user_msg)
-    conversation.add("assistant", reply)
-    
-    return reply
+    conversation.add("assistant", "[ERROR] No handler processed the request")
+    return "[ERROR] No handler processed the request"
 
 # ================== REPL ==================
 
 def print_banner():
     print("\n" + "="*80)
-    print("🚀 SYSAI ENHANCED - Ultimate Local AI Assistant")
+    print("🚀 SYSAI ULTIMATE ENHANCED - Next-Gen Local AI Assistant")
     print("="*80)
-    print(f"Model: {MODEL_NAME}")
+    print(f"Manager Model: {MODEL_NAME}")
     print(f"Math Fallback: {QWEN_MODEL}")
-    print(f"Features: Smart Chat | Research | Coding Workflow | Enhanced Math/Physics | Multi-Search")
-    print(f"Task Detection: LLM-Intelligent Intent Understanding (with Web Fallback)")
-    print(f"Pipeline: Intent → Web Research (if unsure) → Route to Handler")
+    print(f"Specialist Coder: {CODER_MODEL}")
+    print("="*80)
+    print("✓ Smart Chat | Research | Coding Workflow | Enhanced Math/Physics")
+    print("✓ Multi-Search | Output Verification | Fast Path Detection")
+    print("✓ Natural Responses | Dedicated Coder Model | Google Verification")
+    print("="*80)
+    print(f"Fast Path: Greetings, Simple Math, Time, Weather Queries")
+    print(f"Pipeline: Fast Check → Intent → Route → Execute → Verify → Output")
     print(f"Date Library: {'✓ Active' if DATEUTIL_AVAILABLE else '✗ Disabled'}")
     print(f"Math Engine: {'✓ Active' if sp else '✗ Disabled (install sympy)'}")
     print(f"Conversation: {len(conversation.messages)} messages loaded")
@@ -1536,7 +1980,6 @@ def main():
         if cmd == "history":
             show_stats()
             continue
-        
         if cmd == "memory":
             show_memory()
             continue
