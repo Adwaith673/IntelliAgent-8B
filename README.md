@@ -4,9 +4,40 @@ You: explain the news about Ethiopia Volcano Eruption
 
 
 
+## 🔍 Example: Real News Reasoning & Verification
 
-ONE OF HIS OUTPUT THIS SHOWS THAT HE CAN REASON GOOD ABOUT LATEST NEWS ALSO:
-TRY DIFFERENT QUESTIONS YOURSELVES
+Here’s a sample of how the pipeline handles real-world, time-sensitive news.
+The task was:
+
+**User:** “explain the Ethiopia volcano eruption news”
+
+**What the pipeline did:**
+1. Detected the user’s intent as **RESEARCH**
+2. Collected multi-source information from live news outlets  
+3. Ran a verification pass to remove contradictions  
+4. Built a corrected, fact-checked summary  
+5. Stored the information for future queries
+
+**Final verified answer (shortened version):**
+
+The Hayli Gubbi volcano in Ethiopia erupted for the first time in recorded history,
+sending ash toward Yemen, Oman, India, and Pakistan. The eruption followed more
+than 12,000 years of dormancy. No casualties were reported, but several villages
+in the Afar region were covered in ash, impacting grazing land and local livelihoods.
+
+The pipeline automatically cross-checked multiple sources (AP News, NDTV, CBS,
+Scientific American, VAAC reports), resolved inconsistencies, and produced the
+final corrected summary.
+
+---
+
+This example shows how the pipeline:
+- routes queries using the **news/explain/solve** lanes  
+- performs multi-step research  
+- automatically verifies and corrects information  
+- produces cleaner and more reliable outputs than a single-pass prompt
+
+
 
 [PIPELINE] ========== CHECKING FAST PATH ==========
 
